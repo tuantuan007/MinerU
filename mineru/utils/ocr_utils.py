@@ -1,7 +1,10 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import copy
+
 import cv2
 import numpy as np
+
+from .bbox_utils import normalize_to_int_bbox
 
 
 class OcrConfidence:
@@ -9,6 +12,32 @@ class OcrConfidence:
     min_width = 3
 
 LINE_WIDTH_TO_HEIGHT_RATIO_THRESHOLD = 4  # 一般情况下，行宽度超过高度4倍时才是一个正常的横向文本块
+TEXT_REC_ROTATE_RATIO = 1.5
+
+
+def mask_formula_regions_for_ocr_det(
+    bgr_image: np.ndarray,
+    mask_boxes: list[dict] | None,
+) -> np.ndarray:
+    """在 OCR det 前将公式区域置白，避免公式干扰相邻文本行检测。"""
+    if not mask_boxes:
+        return bgr_image
+
+    masked_image = bgr_image.copy()
+    image_h, image_w = masked_image.shape[:2]
+    for mask_box in mask_boxes:
+        bbox = mask_box.get("bbox")
+        if bbox is None:
+            continue
+
+        int_bbox = normalize_to_int_bbox(bbox, image_size=(image_h, image_w))
+        if int_bbox is None:
+            continue
+
+        x0, y0, x1, y1 = int_bbox
+        masked_image[y0:y1, x0:x1] = 255
+
+    return masked_image
 
 
 def merge_spans_to_line(spans, threshold=0.6):
@@ -103,7 +132,7 @@ def sorted_boxes(dt_boxes):
     return:
         sorted boxes(array) with shape [4, 2]
     """
-    num_boxes = dt_boxes.shape[0]
+    num_boxes = len(dt_boxes)
     sorted_boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))
     _boxes = list(sorted_boxes)
 
@@ -330,11 +359,19 @@ def get_adjusted_mfdetrec_res(single_page_mfdetrec_res, useful_list):
     return adjusted_mfdetrec_res
 
 
-def get_ocr_result_list(ocr_res, useful_list, ocr_enable, new_image, lang):
+def get_ocr_result_list(
+    ocr_res,
+    useful_list,
+    ocr_enable,
+    bgr_image,
+    lang,
+):
     paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
     ocr_result_list = []
-    ori_im = new_image.copy()
+    ori_im = bgr_image.copy()
     for box_ocr_res in ocr_res:
+        img_crop = None
+        need_ocr_rec = False
 
         if len(box_ocr_res) == 2:
             p1, p2, p3, p4 = box_ocr_res[0]
@@ -348,7 +385,8 @@ def get_ocr_result_list(ocr_res, useful_list, ocr_enable, new_image, lang):
 
             if ocr_enable:
                 tmp_box = copy.deepcopy(np.array([p1, p2, p3, p4]).astype('float32'))
-                img_crop = get_rotate_crop_image(ori_im, tmp_box)
+                img_crop = get_rotate_crop_image_for_text_rec(ori_im, tmp_box)
+                need_ocr_rec = True
 
         # average_angle_degrees = calculate_angle_degrees(box_ocr_res[0])
         # if average_angle_degrees > 0.5:
@@ -377,22 +415,21 @@ def get_ocr_result_list(ocr_res, useful_list, ocr_enable, new_image, lang):
         p3 = [p3[0] - paste_x + xmin, p3[1] - paste_y + ymin]
         p4 = [p4[0] - paste_x + xmin, p4[1] - paste_y + ymin]
 
-        if ocr_enable:
-            ocr_result_list.append({
-                'category_id': 15,
-                'poly': p1 + p2 + p3 + p4,
-                'score': 1,
-                'text': text,
-                'np_img': img_crop,
-                'lang': lang,
-            })
-        else:
-            ocr_result_list.append({
-                'category_id': 15,
-                'poly': p1 + p2 + p3 + p4,
-                'score': float(round(score, 2)),
-                'text': text,
-            })
+        bbox = normalize_to_int_bbox([p1, p2, p3, p4])
+        if bbox is None:
+            continue
+
+        ocr_item = {
+            "label": "ocr_text",
+            "bbox": bbox,
+            "score": 1.0 if ocr_enable else float(round(score, 2)),
+            "text": text,
+        }
+        if need_ocr_rec:
+            ocr_item["np_img"] = img_crop
+            ocr_item["lang"] = lang
+            ocr_item["_need_ocr_rec"] = True
+        ocr_result_list.append(ocr_item)
 
     return ocr_result_list
 
@@ -406,6 +443,12 @@ def calculate_is_angle(poly):
         # logger.info((p3[1] - p1[1])/height)
         return True
 
+def is_bbox_aligned_rect(points):
+    x_coords = points[:, 0]
+    y_coords = points[:, 1]
+    unique_x = np.unique(x_coords)
+    unique_y = np.unique(y_coords)
+    return len(unique_x) == 2 and len(unique_y) == 2
 
 def get_rotate_crop_image(img, points):
     '''
@@ -419,6 +462,16 @@ def get_rotate_crop_image(img, points):
     points[:, 1] = points[:, 1] - top
     '''
     assert len(points) == 4, "shape of points must be 4*2"
+
+    if is_bbox_aligned_rect(points):
+        xmin = int(np.min(points[:, 0]))
+        xmax = int(np.max(points[:, 0]))
+        ymin = int(np.min(points[:, 1]))
+        ymax = int(np.max(points[:, 1]))
+        new_img = img[ymin:ymax, xmin:xmax].copy()
+        if new_img.shape[0] > 0 and new_img.shape[1] > 0:
+            return new_img
+
     img_crop_width = int(
         max(
             np.linalg.norm(points[0] - points[1]),
@@ -437,6 +490,24 @@ def get_rotate_crop_image(img, points):
         borderMode=cv2.BORDER_REPLICATE,
         flags=cv2.INTER_CUBIC)
     dst_img_height, dst_img_width = dst_img.shape[0:2]
-    if dst_img_height * 1.0 / dst_img_width >= 1.5:
+    if dst_img_height * 1.0 / dst_img_width >= TEXT_REC_ROTATE_RATIO:
         dst_img = np.rot90(dst_img)
     return dst_img
+
+
+def rotate_vertical_crop_if_needed(crop_img, rotate_ratio=TEXT_REC_ROTATE_RATIO):
+    if crop_img is None or crop_img.size == 0:
+        return crop_img
+
+    crop_height, crop_width = crop_img.shape[:2]
+    if crop_width == 0:
+        return crop_img
+
+    if crop_height * 1.0 / crop_width >= rotate_ratio:
+        return np.rot90(crop_img)
+    return crop_img
+
+
+def get_rotate_crop_image_for_text_rec(img, points):
+    crop_img = get_rotate_crop_image(img, points)
+    return rotate_vertical_crop_if_needed(crop_img)
